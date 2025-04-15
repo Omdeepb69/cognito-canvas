@@ -1,135 +1,159 @@
-# cognitocanvas.kv
-# Kivy language file defining the visual layout and structure of the Cognito Canvas UI.
-# Links UI elements like the canvas and buttons to the corresponding Python logic in main.py.
+#:kivy 2.1.0
 
-#:kivy 2.1.0  # Specify the Kivy version being used
-
-#:import Window kivy.core.window.Window
-#:import Factory kivy.factory.Factory
-
-#-------------------------------------------------------------------------------
-# Custom Widget Definitions (Implementations are in main.py)
-#-------------------------------------------------------------------------------
-
-<InteractiveCanvas@Widget>:
-    # This widget is defined in main.py and handles drawing logic.
-    # The canvas instructions below provide a basic background.
-    # Drawing lines/shapes will be added dynamically via the Python class.
+<ModeSelectorButton@ToggleButton>:
+    group: 'modes'
+    size_hint_y: None
+    height: '48dp'
+    font_size: '16sp'
+    background_color: (0.3, 0.5, 0.8, 1) if self.state == 'down' else (0.5, 0.5, 0.5, 1)
+    background_normal: ''
+    background_down: ''
+    color: (1, 1, 1, 1)
+    border: (0, 0, 0, 0)
     canvas.before:
         Color:
-            rgba: 0.95, 0.95, 0.95, 1 # Light gray background for the canvas
-        Rectangle:
+            rgba: self.background_color
+        RoundedRectangle:
             pos: self.pos
             size: self.size
+            radius: [5,]
 
-#-------------------------------------------------------------------------------
-# Main Application Layout
-#-------------------------------------------------------------------------------
+<ActionButton@Button>:
+    size_hint_y: None
+    height: '48dp'
+    font_size: '16sp'
+    background_color: (0.2, 0.6, 0.8, 1)
+    background_normal: ''
+    background_down: ''
+    color: (1, 1, 1, 1)
+    border: (0, 0, 0, 0)
+    canvas.before:
+        Color:
+            rgba: self.background_color if self.state == 'normal' else (0.1, 0.4, 0.6, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [5,]
 
-<MainLayout>:
-    # Root widget, using BoxLayout for vertical arrangement.
+BoxLayout:
     orientation: 'vertical'
-    padding: '5dp' # Padding around the entire layout
-    spacing: '5dp' # Spacing between child widgets (Canvas and Button Bar)
-
-    # Reference to the InteractiveCanvas instance for access in Python logic
-    canvas_widget: canvas_area
-
-    # The main drawing area
-    InteractiveCanvas:
-        id: canvas_area
-        # Takes up most of the vertical space, leaving room for buttons
-        size_hint_y: 0.85
-
-    # Horizontal container for control buttons at the bottom
+    padding: '10dp'
+    spacing: '10dp'
+    
     BoxLayout:
-        orientation: 'horizontal'
-        # Takes up the remaining vertical space
-        size_hint_y: 0.15
-        padding: '5dp' # Padding within the button bar
-        spacing: '10dp' # Spacing between buttons
-
-        # Button to trigger mathematical expression solving
-        Button:
-            text: 'Solve Math'
-            font_size: '16sp' # Slightly smaller font for potentially smaller screens
-            # Calls the solve_math method defined in the MainLayout class (main.py)
-            on_press: root.solve_math()
-            # Basic visual styling
-            background_color: 0.2, 0.6, 0.8, 1 # Blueish color
-            color: 1, 1, 1, 1 # White text
-
-        # Button to trigger flowchart-to-code generation
-        Button:
-            text: 'Generate Code'
-            font_size: '16sp'
-            # Calls the generate_code method defined in the MainLayout class (main.py)
-            on_press: root.generate_code()
-            background_color: 0.3, 0.7, 0.4, 1 # Greenish color
-            color: 1, 1, 1, 1
-
-        # Button to trigger note summarization
-        Button:
-            text: 'Summarize'
-            font_size: '16sp'
-            # Calls the summarize_notes method defined in the MainLayout class (main.py)
-            on_press: root.summarize_notes()
-            background_color: 0.9, 0.7, 0.1, 1 # Yellowish color
-            color: 0, 0, 0, 1 # Black text for better contrast
-
-        # Button to clear the canvas
-        Button:
-            text: 'Clear'
-            font_size: '16sp'
-            # Calls the clear_canvas method defined in the MainLayout class (main.py)
-            on_press: root.clear_canvas()
-            background_color: 0.9, 0.3, 0.3, 1 # Reddish color for destructive action
-            color: 1, 1, 1, 1
-
-#-------------------------------------------------------------------------------
-# Popup Definitions (Optional - for displaying results/errors)
-# These are templates; they are instantiated and populated in main.py
-#-------------------------------------------------------------------------------
-
-<ResultPopup@Popup>:
-    # A popup to display results (e.g., math solutions, summaries)
-    title: 'Result'
-    title_size: '20sp'
-    title_align: 'center'
-    separator_color: 0.2, 0.6, 0.8, 1 # Match Solve Math button color
-    content: ScrollView: # Use ScrollView for potentially long results
-        size_hint: 1, 1
-        do_scroll_x: False # Disable horizontal scrolling
-        Label:
-            id: result_label # ID to access the label content from Python
-            text: root.result_text # Bind to a property in the Popup instance
-            font_size: '16sp'
-            size_hint_y: None # Allow label to grow vertically
-            height: self.texture_size[1] # Set height based on text content
-            text_size: self.width - dp(20), None # Enable text wrapping
-            padding: '10dp', '10dp'
-            halign: 'left'
-            valign: 'top'
-            markup: True # Allow basic text markup if needed
-    size_hint: 0.9, 0.6 # Popup takes 90% width, 60% height of the window
-    auto_dismiss: True # Dismiss when clicking outside
-
-<ErrorPopup@Popup>:
-    # A popup to display error messages
-    title: 'Error'
-    title_size: '20sp'
-    title_align: 'center'
-    separator_color: 0.9, 0.3, 0.3, 1 # Match Clear button color
-    content: Label:
-        id: error_label
-        text: root.error_message # Bind to a property in the Popup instance
-        font_size: '16sp'
-        color: 1, 0.2, 0.2, 1 # Reddish text for error
-        text_size: self.width - dp(20), None # Enable text wrapping
         size_hint_y: None
-        height: self.texture_size[1]
-        padding: '10dp', '10dp'
-        halign: 'center'
-        valign: 'middle'
-    size_hint: 0.8, 0.4 # Slightly smaller popup for errors
-    auto_dismiss: True
+        height: '60dp'
+        spacing: '10dp'
+        
+        Label:
+            text: 'Cognito Canvas'
+            font_size: '24sp'
+            size_hint_x: 0.7
+            bold: True
+            color: (0.2, 0.6, 0.8, 1)
+        
+        ActionButton:
+            text: 'Load'
+            size_hint_x: 0.15
+            on_release: app.show_file_chooser()
+        
+        ActionButton:
+            text: 'Capture'
+            size_hint_x: 0.15
+            on_release: app.capture_image()
+    
+    Label:
+        id: status_label
+        text: 'Ready. Select an image or use the capture button.'
+        size_hint_y: None
+        height: '30dp'
+        color: (0.5, 0.5, 0.5, 1)
+    
+    BoxLayout:
+        spacing: '10dp'
+        
+        # Left panel - Mode Selection and Actions
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.25
+            spacing: '10dp'
+            
+            Label:
+                text: 'Processing Mode'
+                size_hint_y: None
+                height: '30dp'
+                color: (0.2, 0.6, 0.8, 1)
+                bold: True
+            
+            ModeSelectorButton:
+                text: 'Handwritten Notes'
+                state: 'down'
+                on_release: app.set_mode('notes')
+            
+            ModeSelectorButton:
+                text: 'Mathematical Expressions'
+                on_release: app.set_mode('math')
+            
+            ModeSelectorButton:
+                text: 'Flowcharts'
+                on_release: app.set_mode('flowchart')
+            
+            Label:
+                text: 'Actions'
+                size_hint_y: None
+                height: '30dp'
+                color: (0.2, 0.6, 0.8, 1)
+                bold: True
+                
+            ActionButton:
+                text: 'Enhance Image'
+                on_release: app.enhance_image()
+            
+            ActionButton:
+                text: 'Process'
+                background_color: (0.2, 0.8, 0.2, 1)
+                on_release: app.process_image()
+            
+            ActionButton:
+                text: 'Save Results'
+                background_color: (0.8, 0.6, 0.2, 1)
+                on_release: app.save_results()
+                
+            Widget:
+                # Spacer
+        
+        # Right panel - Image Preview and Results
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.75
+            spacing: '10dp'
+            
+            Label:
+                text: 'Image Preview'
+                size_hint_y: None
+                height: '30dp'
+                color: (0.2, 0.6, 0.8, 1)
+                bold: True
+            
+            BoxLayout:
+                size_hint_y: 0.5
+                canvas.before:
+                    Color:
+                        rgba: (0.95, 0.95, 0.95, 1)
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+                
+                ImagePreview:
+                    id: image_preview
+            
+            Label:
+                text: 'Results'
+                size_hint_y: None
+                height: '30dp'
+                color: (0.2, 0.6, 0.8, 1)
+                bold: True
+            
+            ResultViewer:
+                id: result_viewer
+                size_hint_y: 0.5
