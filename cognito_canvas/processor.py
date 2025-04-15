@@ -1,11 +1,11 @@
 # cognito_canvas/processor.py
 
 """
-Backend processing logic for Cognito Canvas.
+Enhanced backend processing logic for Cognito Canvas.
 
 Handles image preprocessing, handwriting recognition (OCR), mathematical
 expression solving, flowchart element detection, code generation from
-flowcharts, and content summarization.
+flowcharts, content summarization, and AI-assisted enhancements using Gemini 2.5.
 """
 
 import cv2
@@ -14,63 +14,144 @@ import easyocr
 import sympy
 import logging
 import re
+import os
+import json
 from collections import defaultdict
+from typing import List, Dict, Tuple, Any, Optional, Union
+import time
+import base64
+import requests
+from PIL import Image
+import io
+
+# Import for Gemini integration
+try:
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    logging.warning("Google Generative AI package not installed. Gemini features will be disabled.")
 
 # --- Configuration & Initialization ---
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize EasyOCR Reader
-# Use GPU if available, otherwise CPU. Specify languages.
-# This initialization can be time-consuming, so it's done once globally.
-try:
-    # Consider adding more languages if needed, e.g., ['en', 'es', 'fr']
-    # Use gpu=True if a CUDA-enabled GPU is available and PyTorch is installed with CUDA support.
-    # Set gpu=False explicitly if you want to force CPU usage or don't have a compatible GPU.
-    reader = easyocr.Reader(['en'], gpu=False)
-    logging.info("EasyOCR Reader initialized successfully.")
-except Exception as e:
-    logging.error(f"Failed to initialize EasyOCR Reader: {e}")
-    # Fallback or raise error depending on desired behavior
-    reader = None # Indicate failure
+# Initialize EasyOCR Reader with expanded language support
+SUPPORTED_LANGUAGES = ['en', 'es', 'fr', 'de', 'zh', 'ja', 'ko', 'ar', 'hi']
+DEFAULT_LANGUAGES = ['en']  # Default to English
+
+# Initialize Gemini API
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', None)
+if GEMINI_API_KEY and GEMINI_AVAILABLE:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Configure Gemini model
+        generation_config = {
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_output_tokens": 8192,
+        }
+        
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        }
+        
+        gemini_model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        logging.info("Gemini 2.5 model initialized successfully")
+    except Exception as e:
+        logging.error(f"Failed to initialize Gemini model: {e}")
+        gemini_model = None
+else:
+    gemini_model = None
+
+# Dictionary of OCR readers for different language combinations
+ocr_readers = {}
+
+def get_ocr_reader(languages: List[str] = None, gpu: bool = False) -> easyocr.Reader:
+    """
+    Gets or initializes an EasyOCR reader for the specified languages.
+    Caches readers to avoid reinitializing.
+    
+    Args:
+        languages: List of language codes to recognize
+        gpu: Whether to use GPU acceleration
+    
+    Returns:
+        An initialized EasyOCR reader
+    """
+    global ocr_readers
+    
+    if not languages:
+        languages = DEFAULT_LANGUAGES
+    
+    # Sort languages to ensure consistent cache key
+    lang_key = "-".join(sorted(languages))
+    reader_key = f"{lang_key}_{gpu}"
+    
+    if reader_key not in ocr_readers:
+        try:
+            ocr_readers[reader_key] = easyocr.Reader(languages, gpu=gpu)
+            logging.info(f"Initialized EasyOCR reader for languages: {languages}")
+        except Exception as e:
+            logging.error(f"Failed to initialize EasyOCR reader for {languages}: {e}")
+            # Fall back to English if available
+            if lang_key != "en":
+                logging.info("Falling back to English OCR")
+                return get_ocr_reader(["en"], gpu)
+            # Otherwise return None
+            return None
+    
+    return ocr_readers[reader_key]
 
 # --- Image Processing ---
 
-def process_image_for_ocr(image: np.ndarray) -> np.ndarray:
+def process_image_for_ocr(image: np.ndarray, enhance_contrast: bool = True) -> np.ndarray:
     """
-    Preprocesses an image for better OCR results.
+    Preprocesses an image for better OCR results with enhanced contrast options.
 
     Args:
-        image: Input image as a NumPy array (BGR format).
+        image: Input image as a NumPy array (BGR format)
+        enhance_contrast: Whether to apply adaptive contrast enhancement
 
     Returns:
-        Preprocessed image as a NumPy array (grayscale).
-        Returns None if the input image is invalid.
+        Preprocessed image as a NumPy array (grayscale)
     """
     if image is None or image.size == 0:
         logging.error("process_image_for_ocr: Invalid input image.")
         return None
 
     try:
-        # 1. Convert to Grayscale
+        # Convert to Grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # 2. Apply Gaussian Blur to reduce noise
-        # blurred = cv2.GaussianBlur(gray, (5, 5), 0) # Optional, might blur small text
-
-        # 3. Apply Adaptive Thresholding
-        # Better for varying lighting conditions than simple thresholding
+        
+        # Enhanced contrast with CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        if enhance_contrast:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+        
+        # Noise reduction
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Apply Adaptive Thresholding
         processed_image = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 11, 5 # Block size and C value might need tuning
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 5
         )
-
-        # Optional: Dilation/Erosion to connect broken parts or remove noise
-        # kernel = np.ones((2,2),np.uint8)
-        # processed_image = cv2.dilate(processed_image, kernel, iterations = 1)
-        # processed_image = cv2.erode(processed_image, kernel, iterations = 1)
-
+        
+        # Morphological operations to improve text quality
+        kernel = np.ones((1, 1), np.uint8)
+        processed_image = cv2.morphologyEx(processed_image, cv2.MORPH_CLOSE, kernel)
+        
         logging.info("Image preprocessed successfully for OCR.")
         return processed_image
     except cv2.error as e:
@@ -82,34 +163,104 @@ def process_image_for_ocr(image: np.ndarray) -> np.ndarray:
 
 # --- Handwriting Recognition ---
 
-def recognize_handwriting(image: np.ndarray) -> list:
+def recognize_handwriting(
+    image: np.ndarray, 
+    languages: List[str] = None,
+    use_gemini: bool = False
+) -> list:
     """
-    Recognizes handwritten text and its bounding boxes from an image using EasyOCR.
+    Recognizes handwritten text from an image using EasyOCR or Gemini 2.5 vision.
 
     Args:
-        image: Input image as a NumPy array (BGR format).
+        image: Input image as a NumPy array (BGR format)
+        languages: List of language codes to use for recognition
+        use_gemini: Whether to use Gemini 2.5 for text recognition
 
     Returns:
         A list of tuples, where each tuple contains:
-        (bounding_box, text, confidence_score).
-        Returns an empty list if OCR fails or no text is found, or if reader is not initialized.
+        (bounding_box, text, confidence_score)
     """
-    if reader is None:
-        logging.error("recognize_handwriting: EasyOCR Reader not initialized.")
-        return []
     if image is None or image.size == 0:
         logging.error("recognize_handwriting: Invalid input image.")
         return []
-
+    
+    # Try Gemini first if requested and available
+    if use_gemini and gemini_model:
+        try:
+            start_time = time.time()
+            logging.info("Attempting handwriting recognition with Gemini 2.5...")
+            
+            # Convert image to bytes for Gemini
+            success, buffer = cv2.imencode(".jpg", image)
+            if not success:
+                logging.error("Failed to encode image for Gemini")
+                # Fall back to EasyOCR
+            else:
+                # Create base64 encoded image
+                image_bytes = buffer.tobytes()
+                
+                # Create prompt with the image
+                gemini_response = gemini_model.generate_content([
+                    "Extract all text from this handwritten or printed document. Return ONLY the text content.",
+                    {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode('utf-8')}
+                ])
+                
+                # Process Gemini response
+                extracted_text = gemini_response.text.strip()
+                if extracted_text:
+                    # Since Gemini doesn't provide bounding boxes, we create a single entry
+                    # covering the entire image
+                    h, w = image.shape[:2]
+                    bbox = [[0, 0], [w, 0], [w, h], [0, h]]  # Full image bounding box
+                    result = [(bbox, extracted_text, 0.95)]  # Assume high confidence
+                    
+                    logging.info(f"Gemini recognition completed in {time.time() - start_time:.2f}s")
+                    return result
+                else:
+                    logging.info("Gemini didn't extract any text, falling back to EasyOCR")
+        except Exception as e:
+            logging.error(f"Error using Gemini for text recognition: {e}")
+            # Fall back to EasyOCR
+    
+    # Use EasyOCR as fallback or primary method
     try:
-        # EasyOCR prefers BGR images directly
+        reader = get_ocr_reader(languages)
+        if not reader:
+            logging.error("No OCR reader available")
+            return []
+        
+        # Process the image with EasyOCR
+        start_time = time.time()
         results = reader.readtext(image)
-        logging.info(f"Handwriting recognition found {len(results)} text blocks.")
-        # Format results for consistency (e.g., ensure bounding box is list of points)
+        logging.info(f"EasyOCR recognition completed in {time.time() - start_time:.2f}s, found {len(results)} text blocks")
+        
+        # Format results
         formatted_results = []
         for (bbox, text, prob) in results:
-            # bbox is typically [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
             formatted_results.append((bbox, text, prob))
+        
+        # If Gemini is available, we can use it to improve the recognition results
+        if gemini_model and formatted_results and not use_gemini:
+            try:
+                # Extract text from results
+                extracted_text = " ".join([text for _, text, _ in formatted_results])
+                
+                # Ask Gemini to improve/correct the text
+                gemini_response = gemini_model.generate_content([
+                    f"The following text was extracted from an image using OCR and may contain errors. "
+                    f"Please correct any obvious OCR errors while preserving the original meaning:\n\n{extracted_text}"
+                ])
+                
+                corrected_text = gemini_response.text.strip()
+                
+                # For now, just log the corrected text
+                logging.info(f"Gemini corrected text: {corrected_text}")
+                
+                # In a real system, you might want to update the OCR results with the corrected text
+                # or return both versions
+            except Exception as e:
+                logging.error(f"Error using Gemini to improve OCR results: {e}")
+        
         return formatted_results
     except Exception as e:
         logging.error(f"Error during handwriting recognition: {e}")
@@ -117,478 +268,1105 @@ def recognize_handwriting(image: np.ndarray) -> list:
 
 # --- Mathematical Expression Solving ---
 
-def solve_mathematical_expression(text: str) -> str:
+def solve_mathematical_expression(text: str, use_gemini: bool = False) -> str:
     """
-    Parses and solves a mathematical expression string using SymPy.
+    Parses and solves a mathematical expression using SymPy or Gemini 2.5.
 
     Args:
-        text: The mathematical expression as a string.
+        text: The mathematical expression as a string
+        use_gemini: Whether to use Gemini for complex expressions
 
     Returns:
-        The solution as a string, or an error message string if parsing/solving fails.
+        The solution as a string, or an error message
     """
     if not text or not isinstance(text, str):
         return "Error: Invalid input expression."
-
-    # Basic cleanup: remove common OCR errors or ambiguities if needed
-    # Example: Replace 'x' with '*' if it likely means multiplication in context
-    # This needs careful handling to avoid breaking variable names like 'x'
+    
+    # Clean and preprocess the text
     processed_text = text.strip()
-    # A simple heuristic: replace 'x' with '*' if surrounded by digits or spaces/digits
+    # Replace common OCR errors in math expressions
     processed_text = re.sub(r'(?<=\d|\s)\s*x\s*(?=\d|\s)', ' * ', processed_text)
-    # Replace common visual ambiguities if necessary (e.g., 'I' -> '1', 'O' -> '0') - Use with caution!
-    # processed_text = processed_text.replace('I', '1').replace('O', '0')
-
-    logging.info(f"Attempting to solve expression: {processed_text}")
-
+    processed_text = processed_text.replace('×', '*').replace('÷', '/')
+    
+    # Try Gemini for complex expressions if requested and available
+    if use_gemini and gemini_model and ('integral' in processed_text.lower() or 
+                                        'derivative' in processed_text.lower() or
+                                        'limit' in processed_text.lower() or
+                                        'sum' in processed_text.lower()):
+        try:
+            logging.info(f"Using Gemini to solve complex expression: {processed_text}")
+            
+            # Create prompt for Gemini
+            prompt = f"""
+            Solve the following mathematical expression. Show your work step by step:
+            
+            {processed_text}
+            
+            Return the solution in a clear format.
+            """
+            
+            gemini_response = gemini_model.generate_content(prompt)
+            solution = gemini_response.text.strip()
+            
+            logging.info(f"Gemini solution for '{processed_text}': {solution}")
+            return solution
+        except Exception as e:
+            logging.error(f"Error using Gemini for math solving: {e}")
+            # Fall back to SymPy
+    
+    # Use SymPy for standard expressions
+    logging.info(f"Attempting to solve expression with SymPy: {processed_text}")
+    
     try:
-        # Use sympify to parse the expression
-        # Add implicit multiplication parsing if needed (e.g., '2x' -> '2*x')
-        expr = sympy.sympify(processed_text, evaluate=True, locals={'pi': sympy.pi, 'e': sympy.E})
-
-        # Evaluate the expression numerically if possible, otherwise simplify
-        # Use evalf() for numerical evaluation, simplify() for symbolic simplification
-        if expr.is_Relational:
-             # Solve equations or inequalities
-             solution = sympy.solve(expr)
-        elif expr.is_number:
-            solution = expr
+        # Handle equation solving vs expression evaluation
+        if "=" in processed_text:
+            # This is an equation to solve
+            sides = processed_text.split("=")
+            if len(sides) != 2:
+                return f"Error: Invalid equation format in '{text}'"
+            
+            left_side = sympy.sympify(sides[0].strip())
+            right_side = sympy.sympify(sides[1].strip())
+            equation = sympy.Eq(left_side, right_side)
+            
+            # Find all symbols in the equation
+            symbols = list(equation.free_symbols)
+            if not symbols:
+                return f"Error: No variables found in equation '{text}'"
+            
+            # Solve for the first symbol (usually x)
+            solution = sympy.solve(equation, symbols[0])
+            solution_str = f"{symbols[0]} = {solution}"
         else:
-            # Try numerical evaluation first
-            try:
-                # Use N() which is an alias for evalf()
-                solution = sympy.N(expr)
-            except (TypeError, AttributeError):
-                 # Fallback to simplification if numerical evaluation fails
-                 solution = sympy.simplify(expr)
-
-
-        solution_str = str(solution)
+            # This is an expression to evaluate
+            expr = sympy.sympify(processed_text, evaluate=True)
+            
+            # Handle different types of expressions
+            if expr.is_Relational:
+                # Handle inequalities
+                solution = sympy.solve(expr)
+                solution_str = str(solution)
+            elif expr.is_number:
+                # Simple numeric expression
+                solution = expr
+                solution_str = str(float(solution))
+            else:
+                # Try numerical evaluation first
+                try:
+                    solution = sympy.N(expr)
+                    solution_str = str(solution)
+                except (TypeError, AttributeError):
+                    # Fallback to simplification
+                    solution = sympy.simplify(expr)
+                    solution_str = str(solution)
+        
         logging.info(f"Expression '{processed_text}' solved. Solution: {solution_str}")
         return solution_str
     except (sympy.SympifyError, TypeError, SyntaxError) as e:
         logging.error(f"Failed to parse or solve expression '{processed_text}': {e}")
+        
+        # Try Gemini as fallback if available
+        if gemini_model:
+            try:
+                logging.info(f"Attempting to solve with Gemini as fallback: {processed_text}")
+                prompt = f"Solve this mathematical expression: {processed_text}"
+                gemini_response = gemini_model.generate_content(prompt)
+                solution = gemini_response.text.strip()
+                logging.info(f"Gemini fallback solution for '{processed_text}': {solution}")
+                return solution
+            except Exception as gemini_error:
+                logging.error(f"Gemini fallback also failed: {gemini_error}")
+        
         return f"Error: Could not solve '{text}'. Invalid expression or unsupported format."
     except Exception as e:
         logging.error(f"Unexpected error solving expression '{processed_text}': {e}")
         return f"Error: An unexpected error occurred while solving '{text}'."
 
+# --- Flowchart and Shape Detection ---
 
-# --- Flowchart Detection ---
-
-def _classify_shape(approx_poly):
-    """Helper function to classify shapes based on approximated polygon vertices."""
-    num_vertices = len(approx_poly)
-    if num_vertices == 3:
-        return "Triangle" # Potentially part of an arrow or other symbol
-    elif num_vertices == 4:
-        # Could be rectangle or diamond. Check aspect ratio and angles for better classification.
-        # For simplicity here, we'll differentiate based on bounding box vs contour area later if needed.
-        # A simple check: bounding box aspect ratio
-        x, y, w, h = cv2.boundingRect(approx_poly)
-        aspect_ratio = float(w)/h if h != 0 else 0
-        # Diamonds are often wider than tall or vice-versa significantly, or rotated.
-        # Rectangles are typically closer to standard orientations.
-        # This is a heuristic and might need refinement.
-        if 0.8 < aspect_ratio < 1.2: # More square-like might be diamond (if rotated)
-             # Further checks needed for rotation/angles for robust diamond detection
-             return "Diamond" # Placeholder, needs better logic
-        else:
-             return "Rectangle"
-    # elif num_vertices > 4: # Could be circle/ellipse if smooth
-    #     area = cv2.contourArea(approx_poly)
-    #     x,y,w,h = cv2.boundingRect(approx_poly)
-    #     radius = w / 2
-    #     if abs(1 - (float(w)/h)) <= 0.2 and abs(1 - (area / (np.pi * (radius**2)))) <= 0.2:
-    #         return "Circle/Ellipse" # Often used for start/end nodes
-    else:
-        return "Unknown"
-
-def detect_flowchart_elements(image: np.ndarray) -> list:
+def detect_shapes(image: np.ndarray) -> List[Dict]:
     """
-    Detects basic flowchart elements (rectangles, diamonds) in an image using OpenCV.
-    Associates recognized text with detected shapes.
-
+    Detects basic shapes (rectangles, circles, triangles, diamonds) in an image.
+    
     Args:
-        image: Input image as a NumPy array (BGR format).
-
+        image: Input image as a NumPy array (BGR format)
+        
     Returns:
-        A list of dictionaries, each representing a detected element:
-        {'shape': 'Rectangle'|'Diamond'|'Unknown', 'bbox': [x, y, w, h], 'center': (cx, cy), 'text': 'associated_text'}
-        Returns an empty list if detection fails or no elements are found.
+        A list of dictionaries, each representing a detected shape
+    """
+    if image is None or image.size == 0:
+        logging.error("detect_shapes: Invalid input image.")
+        return []
+
+    shapes = []
+    try:
+        # Convert to grayscale if not already
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        # Apply blur and edge detection
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Dilate to close gaps in edges
+        kernel = np.ones((3, 3), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+        
+        # Find contours
+        contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Minimum area to consider to filter out noise
+        min_area = 500
+        
+        # Process each contour
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+            
+            # Approximate the contour
+            perimeter = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+            
+            # Get bounding box and center
+            x, y, w, h = cv2.boundingRect(approx)
+            center = (x + w // 2, y + h // 2)
+            
+            # Determine shape type based on number of vertices
+            vertices = len(approx)
+            shape_type = "unknown"
+            
+            # For circle detection
+            area = cv2.contourArea(contour)
+            radius = w / 2
+            # Check if shape is approximately circular
+            circle_area_ratio = abs(1 - (area / (np.pi * (radius**2))))
+            aspect_ratio = float(w) / h if h > 0 else 0
+            
+            if vertices == 3:
+                shape_type = "triangle"
+            elif vertices == 4:
+                # Check if square or rectangle or diamond
+                aspect_ratio = float(w) / h if h > 0 else 0
+                if 0.95 <= aspect_ratio <= 1.05:
+                    # Check if it's a diamond (rotated square)
+                    # Calculate standard deviation of x and y coordinates
+                    coords = approx.reshape(-1, 2)
+                    std_x = np.std(coords[:, 0])
+                    std_y = np.std(coords[:, 1])
+                    if abs(std_x - std_y) < 10:  # Similar variation in x and y -> likely square
+                        shape_type = "square"
+                    else:
+                        shape_type = "diamond"
+                else:
+                    shape_type = "rectangle"
+            elif vertices >= 5 and vertices <= 10 and circle_area_ratio < 0.2:
+                # Approximate circles have consistent distance from center to edge
+                shape_type = "circle"
+            elif vertices > 10:
+                # Many vertices suggests a circle or complex shape
+                shape_type = "circle" if circle_area_ratio < 0.2 else "complex"
+            
+            shapes.append({
+                "shape": shape_type,
+                "bbox": [x, y, w, h],
+                "center": center,
+                "vertices": vertices,
+                "contour": contour.tolist(),  # Convert to list for serialization
+                "text": ""  # Placeholder for text to be associated
+            })
+        
+        logging.info(f"Detected {len(shapes)} shapes in the image")
+        return shapes
+    except Exception as e:
+        logging.error(f"Error detecting shapes: {e}")
+        return []
+
+def detect_flowchart_elements(image: np.ndarray, use_gemini: bool = False) -> List[Dict]:
+    """
+    Detects flowchart elements including shapes and connections.
+    
+    Args:
+        image: Input image as a NumPy array (BGR format)
+        use_gemini: Whether to use Gemini for more accurate detection
+        
+    Returns:
+        A list of dictionaries representing detected elements
     """
     if image is None or image.size == 0:
         logging.error("detect_flowchart_elements: Invalid input image.")
         return []
-
-    elements = []
+    
+    # Try using Gemini to analyze the flowchart if requested and available
+    if use_gemini and gemini_model:
+        try:
+            logging.info("Using Gemini for flowchart analysis...")
+            
+            # Convert image to bytes for Gemini
+            success, buffer = cv2.imencode(".jpg", image)
+            if not success:
+                logging.error("Failed to encode image for Gemini flowchart analysis")
+            else:
+                # Create base64 encoded image
+                image_bytes = buffer.tobytes()
+                
+                # Create prompt with the image
+                prompt = """
+                Analyze this flowchart image. Identify all elements including:
+                1. Shapes (rectangles, diamonds, circles, etc.)
+                2. Text within each shape
+                3. Connections between shapes (arrows)
+                
+                Return the results in JSON format with this structure:
+                {
+                  "elements": [
+                    {
+                      "shape": "rectangle|diamond|circle|etc.",
+                      "text": "content inside the shape",
+                      "position": "top|middle|bottom|etc."
+                    },
+                    ...
+                  ],
+                  "connections": [
+                    {
+                      "from": "text of source shape",
+                      "to": "text of destination shape",
+                      "label": "text on the arrow (if any)"
+                    },
+                    ...
+                  ]
+                }
+                """
+                
+                gemini_response = gemini_model.generate_content([
+                    prompt,
+                    {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode('utf-8')}
+                ])
+                
+                # Process Gemini response
+                response_text = gemini_response.text
+                
+                # Extract the JSON part from the response
+                json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = response_text
+                
+                # Try to parse as JSON
+                try:
+                    flowchart_data = json.loads(json_str)
+                    logging.info(f"Gemini successfully analyzed flowchart: {len(flowchart_data.get('elements', []))} elements")
+                    
+                    # Convert to our format
+                    elements = []
+                    for idx, element in enumerate(flowchart_data.get('elements', [])):
+                        elements.append({
+                            'shape': element.get('shape', 'unknown').lower(),
+                            'text': element.get('text', ''),
+                            'position': element.get('position', ''),
+                            # Add placeholder for bbox and center since Gemini doesn't provide pixel coordinates
+                            'bbox': [0, 0, 100, 50],  # Placeholder
+                            'center': (50, 25),  # Placeholder
+                            'index': idx  # Keep track of order
+                        })
+                    
+                    # We can also store the connections information
+                    connections = flowchart_data.get('connections', [])
+                    
+                    # TODO: If we need actual bounding boxes, we could combine this with OpenCV shape detection
+                    return elements
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse Gemini flowchart response as JSON: {e}")
+                    logging.error(f"Raw response: {response_text}")
+        except Exception as e:
+            logging.error(f"Error using Gemini for flowchart analysis: {e}")
+    
+    # Fall back to traditional CV approach
     try:
-        # 1. Preprocessing for Shape Detection
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Use Canny edge detection or adaptive thresholding
-        # Canny might be better for distinct shapes
-        edges = cv2.Canny(blurred, 50, 150)
-        # Or use thresholding (might merge text with shapes)
-        # thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        #                                cv2.THRESH_BINARY_INV, 11, 2)
-
-        # Dilate edges to close gaps
-        kernel = np.ones((3,3), np.uint8)
-        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
-
-
-        # 2. Find Contours
-        contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # Use RETR_TREE if shapes can be nested, but EXTERNAL is simpler for basic flowcharts
-
-        # 3. Recognize Text (run once on the original image)
-        text_results = recognize_handwriting(image) # Use original image for better OCR
-
-        # 4. Filter and Classify Contours
-        min_area = 500 # Minimum area to filter out noise - adjust based on expected element size
-        detected_shapes = []
-
-        for contour in contours:
-            if cv2.contourArea(contour) < min_area:
-                continue
-
-            # Approximate the contour shape
-            perimeter = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True) # Adjust epsilon (0.02-0.05)
-
-            shape_type = _classify_shape(approx)
-
-            if shape_type in ["Rectangle", "Diamond"]:
-                x, y, w, h = cv2.boundingRect(approx)
-                center_x = x + w // 2
-                center_y = y + h // 2
-                detected_shapes.append({
-                    'shape': shape_type,
-                    'bbox': [x, y, w, h],
-                    'center': (center_x, center_y),
-                    'contour': contour, # Keep contour for point-in-polygon test
-                    'text': '' # Placeholder for associated text
-                })
-
-        # 5. Associate Text with Shapes
-        # Find which shape contains the center of each text block
-        if text_results:
-            for shape in detected_shapes:
-                shape_contour = shape['contour']
-                shape_center_x, shape_center_y = shape['center']
-                min_dist = float('inf')
-                associated_text = ""
-
-                for text_bbox, text, _ in text_results:
-                    # Calculate center of the text bounding box
-                    # EasyOCR bbox format: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-                    pts = np.array(text_bbox, dtype=np.int32)
-                    text_center_x = int(np.mean(pts[:, 0]))
-                    text_center_y = int(np.mean(pts[:, 1]))
-
-                    # Check if text center is inside the shape contour
-                    # Use cv2.pointPolygonTest
-                    # dist = cv2.pointPolygonTest(shape_contour, (text_center_x, text_center_y), False) >= 0 # True if inside or on edge
-
-                    # Alternative: Check distance between shape center and text center
-                    dist = np.sqrt((shape_center_x - text_center_x)**2 + (shape_center_y - text_center_y)**2)
-
-                    # Simple association: find the closest text block within a reasonable distance
-                    # A better approach might involve checking overlap percentage or text containment.
-                    # For now, associate the closest text block whose center is reasonably near the shape center.
-                    # This threshold needs tuning based on typical drawing scale.
-                    max_association_distance = max(shape['bbox'][2], shape['bbox'][3]) # Max of width/height
-
-                    if dist < min_dist and dist < max_association_distance:
-                         # Check if text center is actually inside the shape's bounding box as a sanity check
-                         sx, sy, sw, sh = shape['bbox']
-                         if sx <= text_center_x <= sx + sw and sy <= text_center_y <= sy + sh:
-                            min_dist = dist
-                            associated_text = text
-
-                shape['text'] = associated_text.strip()
-                # Remove contour from final output if not needed downstream
-                del shape['contour']
-
-
-        elements = detected_shapes
-        logging.info(f"Detected {len(elements)} potential flowchart elements.")
-
-    except cv2.error as e:
-        logging.error(f"OpenCV error during flowchart detection: {e}")
-        return []
+        # 1. Detect shapes
+        shapes = detect_shapes(image)
+        
+        # 2. Detect text
+        text_results = recognize_handwriting(image)
+        
+        # 3. Associate text with shapes
+        for shape in shapes:
+            shape_center_x, shape_center_y = shape['center']
+            min_dist = float('inf')
+            associated_text = ""
+            
+            for text_bbox, text, _ in text_results:
+                # Calculate center of the text bounding box
+                pts = np.array(text_bbox, dtype=np.int32)
+                text_center_x = int(np.mean(pts[:, 0]))
+                text_center_y = int(np.mean(pts[:, 1]))
+                
+                # Check distance between shape center and text center
+                dist = np.sqrt((shape_center_x - text_center_x)**2 + (shape_center_y - text_center_y)**2)
+                
+                # Associate the closest text block within a reasonable distance
+                max_association_distance = max(shape['bbox'][2], shape['bbox'][3])
+                
+                if dist < min_dist and dist < max_association_distance:
+                    # Check if text center is inside the shape's bounding box
+                    sx, sy, sw, sh = shape['bbox']
+                    if sx <= text_center_x <= sx + sw and sy <= text_center_y <= sy + sh:
+                        min_dist = dist
+                        associated_text = text
+            
+            shape['text'] = associated_text.strip()
+        
+        # 4. Detect arrows/connections (simplified)
+        # This is just a placeholder - comprehensive arrow detection would require more complex analysis
+        # For now, we'll just use vertical position to infer connections
+        sorted_shapes = sorted(shapes, key=lambda s: s['center'][1])  # Sort by y-coordinate
+        
+        # Tag shapes with their position in the flowchart
+        for i, shape in enumerate(sorted_shapes):
+            if i == 0:
+                shape['position'] = 'start'
+            elif i == len(sorted_shapes) - 1:
+                shape['position'] = 'end'
+            else:
+                shape['position'] = 'middle'
+        
+        # 5. Classify flowchart elements based on shape and position
+        for shape in sorted_shapes:
+            shape_type = shape['shape']
+            if shape_type == 'circle' or shape_type == 'oval':
+                if shape['position'] == 'start' or shape['position'] == 'end':
+                    shape['flowchart_type'] = 'terminal'
+                else:
+                    shape['flowchart_type'] = 'connector'
+            elif shape_type == 'diamond':
+                shape['flowchart_type'] = 'decision'
+            elif shape_type == 'rectangle' or shape_type == 'square':
+                shape['flowchart_type'] = 'process'
+            elif shape_type == 'parallelogram':
+                shape['flowchart_type'] = 'input_output'
+            else:
+                shape['flowchart_type'] = 'unknown'
+        
+        logging.info(f"Detected {len(sorted_shapes)} flowchart elements")
+        return sorted_shapes
     except Exception as e:
-        logging.error(f"Unexpected error during flowchart detection: {e}")
+        logging.error(f"Error detecting flowchart elements: {e}")
         return []
-
-    return elements
-
 
 # --- Code Generation ---
 
-def generate_code_from_flowchart(elements: list) -> str:
+def generate_code_from_flowchart(elements: List[Dict], language: str = 'python', use_gemini: bool = True) -> str:
     """
-    Generates basic Python code stubs from detected flowchart elements.
-    Assumes a simple top-to-bottom flow based on vertical position.
-
+    Generates code from detected flowchart elements.
+    
     Args:
-        elements: A list of dictionaries representing flowchart elements,
-                  as returned by detect_flowchart_elements.
-                  Each dict should have 'shape', 'center', and 'text'.
-
+        elements: A list of dictionaries representing flowchart elements
+        language: Target programming language ('python', 'javascript', 'java', etc.)
+        use_gemini: Whether to use Gemini for code generation
+        
     Returns:
-        A string containing the generated Python code, or a message if no elements provided.
+        A string containing the generated code
     """
     if not elements:
-        return "# No flowchart elements detected to generate code."
-
+        return f"// No flowchart elements detected to generate {language} code."
+    
+    # Use Gemini for more intelligent code generation if available
+    if use_gemini and gemini_model:
+        try:
+            logging.info(f"Using Gemini for {language} code generation from flowchart...")
+            
+            # Create structured representation of the flowchart
+            flowchart_text = []
+            for i, element in enumerate(elements):
+                shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+                text = element.get('text', f'Step {i+1}')
+                position = element.get('position', 'middle')
+                
+                flowchart_text.append(f"Element {i+1}: {shape_type} - '{text}' - Position: {position}")
+            
+            # For connections, we'll use position as a simple proxy
+            # In a real system, you'd have actual connection data
+            connections = []
+            for i in range(len(elements) - 1):
+                connections.append(f"Connection: Element {i+1} -> Element {i+2}")
+            
+            # Create prompt for Gemini
+            prompt = f"""
+            Generate {language} code from the following flowchart:
+            
+            Flowchart Elements:
+            {'\n'.join(flowchart_text)}
+            
+            Connections:
+            {'\n'.join(connections)}
+            
+            Requirements:
+            1. Generate executable, well-structured {language} code that follows best practices
+            2. Include comments explaining the logic and flow
+            3. Handle decision points (diamonds) with proper conditional statements
+            4. Include appropriate error handling
+            5. Structure the code with proper functions or classes if needed
+            
+            Return only the code with no explanations before or after.
+            """
+            
+            gemini_response = gemini_model.generate_content(prompt)
+            generated_code = gemini_response.text.strip()
+            
+            # Strip code block markers if present
+            code_match = re.search(r'```(?:\w+)?\n(.*?)\n```', generated_code, re.DOTALL)
+            if code_match:
+                generated_code = code_match.group(1)
+            
+            logging.info(f"Generated {language} code using Gemini")
+            return generated_code
+        except Exception as e:
+            logging.error(f"Error using Gemini for code generation: {e}")
+            # Fall back to basic generation
+    
+    # Basic generation if Gemini not available or failed
+    logging.info(f"Using basic method for {language} code generation")
+    
     # Sort elements by vertical position (top to bottom)
-    elements.sort(key=lambda el: el['center'][1]) # Sort by y-coordinate of center
+    elements.sort(key=lambda el: el['center'][1])
+    
+    # Generate appropriate code based on language
+    if language.lower() == 'python':
+        code = generate_python_code(elements)
+    elif language.lower() == 'javascript':
+        code = generate_javascript_code(elements)
+    elif language.lower() in ['java', 'c++', 'c#']:
+        code = generate_
 
-    code_lines = []
-    indent_level = 0
 
-    def add_line(text):
-        code_lines.append("    " * indent_level + text)
 
-    add_line("import time # Placeholder import")
-    add_line("")
+# --- Code Generation (continued from where it cut off) ---
 
-    # Basic mapping: Rectangle -> function call/action, Diamond -> if/else
-    # This is highly simplified and doesn't handle loops, complex branches, or actual flow arrows.
+def generate_python_code(elements: List[Dict]) -> str:
+    """Generates Python code from flowchart elements."""
+    code_lines = ["# Python code generated from flowchart", ""]
+    
+    # Track decision blocks and their content
+    decision_stack = []
+    indentation = 0
+    indent = "    "  # 4 spaces
+    
+    def add_line(line):
+        code_lines.append(indent * indentation + line)
+    
+    # Add main function definition
+    add_line("def main():")
+    indentation += 1
+    
+    # Process each flowchart element
     for i, element in enumerate(elements):
-        shape = element.get('shape', 'Unknown')
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
         text = element.get('text', '').strip()
-        # Sanitize text to be used as comments or potentially variable/function names
-        sanitized_text = re.sub(r'\W|^(?=\d)', '_', text) if text else f"step_{i}"
-
-        if shape == "Rectangle":
-            # Assume rectangle represents an action or function call
-            if text:
-                add_line(f"# Action: {text}")
-                # Try to make a plausible function name
-                func_name = sanitized_text.lower()
-                add_line(f"print('Executing: {text}') # Placeholder for: {func_name}()")
-                add_line("time.sleep(0.5) # Simulate action")
+        
+        if not text:
+            text = f"step_{i+1}"
+        
+        # Normalize text for variable names
+        var_text = text.lower().replace(' ', '_').replace('-', '_')
+        var_text = re.sub(r'[^\w]', '', var_text)
+        
+        if shape_type == 'terminal':
+            if i == 0:  # Start terminal
+                add_line(f"# Start: {text}")
+                add_line("print('Starting process...')")
+            else:  # End terminal
+                add_line(f"# End: {text}")
+                add_line("print('Process completed.')")
+                add_line("return")
+                
+        elif shape_type == 'process':
+            add_line(f"# Process: {text}")
+            add_line(f"# TODO: Implement {var_text} logic")
+            add_line(f"{var_text}_result = process_{var_text}()")
+            
+        elif shape_type == 'input_output':
+            if 'input' in text.lower():
+                add_line(f"# Input: {text}")
+                add_line(f"{var_text} = input('Enter {text}: ')")
             else:
-                add_line(f"# Action: Step {i}")
-                add_line(f"print('Executing step {i}')")
-                add_line("time.sleep(0.5)")
-            add_line("") # Add spacing
+                add_line(f"# Output: {text}")
+                add_line(f"print({var_text})")
+                
+        elif shape_type == 'decision':
+            add_line(f"# Decision: {text}")
+            add_line(f"if check_condition('{text}'):")
+            decision_stack.append(indentation)
+            indentation += 1
+            
+        elif shape_type == 'connector':
+            add_line(f"# Connector: {text}")
+            add_line("# This is a connector point in the flowchart")
+            
+            # Check if we need to close any decision blocks
+            if decision_stack and i < len(elements) - 1:
+                next_element = elements[i + 1]
+                next_y = next_element['center'][1]
+                if next_y > element['center'][1] + 20:  # Simple heuristic
+                    indentation = decision_stack.pop()
+                    add_line("else:")
+                    indentation += 1
+    
+    # Close any remaining decision blocks
+    while decision_stack:
+        indentation = decision_stack.pop()
+    
+    # Decrease indentation back to main level
+    indentation = 1
+    
+    # Add helper functions
+    add_line("")
+    add_line("def check_condition(condition):")
+    add_line("    # TODO: Implement actual condition checking")
+    add_line("    print(f'Checking condition: {condition}')")
+    add_line("    return True  # Default to True for demonstration")
+    
+    # Add other necessary helper functions based on processes found
+    for element in elements:
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+        if shape_type == 'process':
+            text = element.get('text', '').strip()
+            if text:
+                var_text = text.lower().replace(' ', '_').replace('-', '_')
+                var_text = re.sub(r'[^\w]', '', var_text)
+                add_line("")
+                add_line(f"def process_{var_text}():")
+                add_line(f"    # TODO: Implement {text} process")
+                add_line("    return True")
+    
+    # Add execution guard
+    code_lines.extend([
+        "",
+        "# Execute the main function when script is run directly",
+        "if __name__ == '__main__':",
+        "    main()"
+    ])
+    
+    return "\n".join(code_lines)
 
-        elif shape == "Diamond":
-            # Assume diamond represents a condition
-            condition = text if text else f"condition_{i}"
-            add_line(f"if True: # Condition: {condition}")
-            indent_level += 1
-            add_line("# Code for 'True' branch")
-            add_line("print(f'Condition \"{condition}\" is True')")
-            add_line("pass # Replace with actual logic")
-            indent_level -= 1
-            add_line("else:")
-            indent_level += 1
-            add_line("# Code for 'False' branch")
-            add_line("print(f'Condition \"{condition}\" is False')")
-            add_line("pass # Replace with actual logic")
-            indent_level -= 1
-            add_line("") # Add spacing
+def generate_javascript_code(elements: List[Dict]) -> str:
+    """Generates JavaScript code from flowchart elements."""
+    code_lines = ["// JavaScript code generated from flowchart", ""]
+    
+    # Track decision blocks and their content
+    decision_stack = []
+    indentation = 0
+    indent = "  "  # 2 spaces (JS convention)
+    
+    def add_line(line):
+        code_lines.append(indent * indentation + line)
+    
+    # Add main function definition
+    add_line("function main() {")
+    indentation += 1
+    
+    # Process each flowchart element
+    for i, element in enumerate(elements):
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+        text = element.get('text', '').strip()
+        
+        if not text:
+            text = f"step{i+1}"
+        
+        # Normalize text for variable names
+        var_text = text.toLowerCase().replace(/ /g, '_').replace(/-/g, '_')
+        var_text = var_text.replace(/[^\w]/g, '')
+        
+        if shape_type == 'terminal':
+            if i == 0:  # Start terminal
+                add_line(`// Start: ${text}`)
+                add_line("console.log('Starting process...');")
+            else:  # End terminal
+                add_line(`// End: ${text}`)
+                add_line("console.log('Process completed.');")
+                add_line("return;")
+                
+        elif shape_type == 'process':
+            add_line(`// Process: ${text}`)
+            add_line(`// TODO: Implement ${var_text} logic`)
+            add_line(`const ${var_text}Result = process${var_text.charAt(0).toUpperCase() + var_text.slice(1)}();`)
+            
+        elif shape_type == 'input_output':
+            if text.toLowerCase().includes('input'):
+                add_line(`// Input: ${text}`)
+                add_line(`const ${var_text} = prompt('Enter ${text}:');`)
+            else:
+                add_line(`// Output: ${text}`)
+                add_line(`console.log(${var_text});`)
+                
+        elif shape_type == 'decision':
+            add_line(`// Decision: ${text}`)
+            add_line(`if (checkCondition('${text}')) {`)
+            decision_stack.append(indentation)
+            indentation += 1
+            
+        elif shape_type == 'connector':
+            add_line(`// Connector: ${text}`)
+            add_line("// This is a connector point in the flowchart")
+            
+            # Check if we need to close any decision blocks
+            if decision_stack.length > 0 && i < elements.length - 1:
+                next_element = elements[i + 1]
+                next_y = next_element['center'][1]
+                if next_y > element['center'][1] + 20:  # Simple heuristic
+                    indentation = decision_stack.pop()
+                    add_line("} else {")
+                    indentation += 1
+    
+    # Close any remaining decision blocks
+    while decision_stack.length > 0:
+        indentation = decision_stack.pop()
+        add_line("}")
+    
+    # Decrease indentation back to main level
+    indentation = 1
+    add_line("}")
+    
+    # Add helper functions
+    add_line("")
+    add_line("function checkCondition(condition) {")
+    add_line("  // TODO: Implement actual condition checking")
+    add_line("  console.log(`Checking condition: ${condition}`);")
+    add_line("  return true;  // Default to true for demonstration")
+    add_line("}")
+    
+    # Add other necessary helper functions based on processes found
+    for element in elements:
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+        if shape_type == 'process':
+            text = element.get('text', '').strip()
+            if text:
+                var_text = text.toLowerCase().replace(/ /g, '_').replace(/-/g, '_')
+                var_text = var_text.replace(/[^\w]/g, '')
+                func_name = var_text.charAt(0).toUpperCase() + var_text.slice(1)
+                add_line("")
+                add_line(`function process${func_name}() {`)
+                add_line(`  // TODO: Implement ${text} process`)
+                add_line("  return true;")
+                add_line("}")
+    
+    # Add execution line
+    code_lines.push("", "// Execute the main function", "main();")
+    
+    return code_lines.join("\n")
 
-        # Other shapes could be added here (e.g., Start/End nodes)
-
-    if not code_lines:
-         return "# No recognized flowchart shapes found to generate code."
-
-    # Add a basic structure if needed (e.g., wrap in a main function)
-    final_code = ["def generated_flowchart_logic():"]
-    final_code.extend(["    " + line for line in code_lines])
-    final_code.append("\nif __name__ == '__main__':")
-    final_code.append("    generated_flowchart_logic()")
-
-
-    logging.info("Generated Python code stub from flowchart elements.")
-    return "\n".join(final_code)
-
+def generate_java_code(elements: List[Dict]) -> str:
+    """Generates Java code from flowchart elements."""
+    code_lines = ["// Java code generated from flowchart", ""]
+    
+    # Add class definition
+    class_name = "FlowchartImplementation"
+    code_lines.append(f"public class {class_name} {{")
+    
+    # Track decision blocks and their content
+    decision_stack = []
+    indentation = 1
+    indent = "    "  # 4 spaces
+    
+    def add_line(line):
+        code_lines.append(indent * indentation + line)
+    
+    # Add main method definition
+    add_line("public static void main(String[] args) {")
+    add_line("    new FlowchartImplementation().execute();")
+    add_line("}")
+    
+    # Add execute method
+    add_line("")
+    add_line("public void execute() {")
+    indentation += 1
+    
+    # Process each flowchart element
+    for i, element in enumerate(elements):
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+        text = element.get('text', '').strip()
+        
+        if not text:
+            text = f"step{i+1}"
+        
+        # Normalize text for variable names
+        var_text = text.lower().replace(' ', '_').replace('-', '_')
+        var_text = re.sub(r'[^\w]', '', var_text)
+        
+        if shape_type == 'terminal':
+            if i == 0:  # Start terminal
+                add_line(f"// Start: {text}")
+                add_line("System.out.println(\"Starting process...\");")
+            else:  # End terminal
+                add_line(f"// End: {text}")
+                add_line("System.out.println(\"Process completed.\");")
+                add_line("return;")
+                
+        elif shape_type == 'process':
+            add_line(f"// Process: {text}")
+            add_line(f"// TODO: Implement {var_text} logic")
+            add_line(f"boolean {var_text}Result = process{var_text.capitalize()}();")
+            
+        elif shape_type == 'input_output':
+            if 'input' in text.lower():
+                add_line(f"// Input: {text}")
+                add_line("Scanner scanner = new Scanner(System.in);")
+                add_line(f"System.out.print(\"Enter {text}: \");")
+                add_line(f"String {var_text} = scanner.nextLine();")
+            else:
+                add_line(f"// Output: {text}")
+                add_line(f"System.out.println({var_text});")
+                
+        elif shape_type == 'decision':
+            add_line(f"// Decision: {text}")
+            add_line(f"if (checkCondition(\"{text}\")) {{")
+            decision_stack.append(indentation)
+            indentation += 1
+            
+        elif shape_type == 'connector':
+            add_line(f"// Connector: {text}")
+            add_line("// This is a connector point in the flowchart")
+            
+            # Check if we need to close any decision blocks
+            if decision_stack and i < len(elements) - 1:
+                next_element = elements[i + 1]
+                next_y = next_element['center'][1]
+                if next_y > element['center'][1] + 20:  # Simple heuristic
+                    indentation = decision_stack.pop()
+                    add_line("} else {")
+                    indentation += 1
+    
+    # Close any remaining decision blocks
+    while decision_stack:
+        indentation = decision_stack.pop()
+        add_line("}")
+    
+    # Decrease indentation back to execute level
+    indentation = 2
+    add_line("}")
+    
+    # Add helper methods
+    indentation = 1
+    add_line("")
+    add_line("private boolean checkCondition(String condition) {")
+    add_line("    // TODO: Implement actual condition checking")
+    add_line("    System.out.println(\"Checking condition: \" + condition);")
+    add_line("    return true;  // Default to true for demonstration")
+    add_line("}")
+    
+    # Add other necessary helper methods based on processes found
+    for element in elements:
+        shape_type = element.get('flowchart_type', element.get('shape', 'unknown'))
+        if shape_type == 'process':
+            text = element.get('text', '').strip()
+            if text:
+                var_text = text.lower().replace(' ', '_').replace('-', '_')
+                var_text = re.sub(r'[^\w]', '', var_text)
+                method_name = var_text.capitalize()
+                add_line("")
+                add_line(f"private boolean process{method_name}() {{")
+                add_line(f"    // TODO: Implement {text} process")
+                add_line("    return true;")
+                add_line("}")
+    
+    # Close class
+    code_lines.append("}")
+    
+    return "\n".join(code_lines)
 
 # --- Content Summarization ---
 
-def summarize_canvas_content(image: np.ndarray, text_results: list) -> str:
+def summarize_notes(text: str, use_gemini: bool = True) -> str:
     """
-    Generates a simple summary of the canvas content based on recognized text
-    and potentially detected shapes (though shape info isn't used here yet).
-
+    Summarizes handwritten or typed notes.
+    
     Args:
-        image: Input image (NumPy array) - currently unused but available for future enhancements.
-        text_results: A list of tuples (bbox, text, confidence) from OCR.
-
+        text: The text to summarize
+        use_gemini: Whether to use Gemini for better summarization
+        
     Returns:
-        A string containing a summary of the recognized text.
+        A summarized version of the text
     """
-    if image is None: # Keep image arg for potential future use (e.g., analyzing layout)
-        logging.warning("summarize_canvas_content: Input image is None.")
-        # Continue with text if available
+    if not text or len(text.strip()) == 0:
+        return "Error: No text provided for summarization."
+    
+    # Use Gemini for intelligent summarization if available
+    if use_gemini and gemini_model:
+        try:
+            logging.info("Using Gemini for note summarization...")
+            
+            # Create prompt for Gemini
+            prompt = f"""
+            Summarize the following notes. Extract key points, main ideas, and important details.
+            Keep the summary concise while maintaining the core information and meaning:
 
-    if not text_results:
-        return "Summary: No text content recognized on the canvas."
-
-    # Simple summarization: Concatenate all recognized text.
-    # Could be improved by sorting text spatially, filtering low confidence, using NLP etc.
-    full_text = " ".join([res[1] for res in text_results])
-
-    # Basic cleanup of concatenated text
-    summary = ' '.join(full_text.split()) # Remove extra whitespace
-
-    # Optional: Add context if shapes were detected (requires passing shape info)
-    # num_shapes = len(detected_elements) # If elements were passed
-    # summary = f"Detected {num_shapes} shapes.\nNotes: {summary}"
-
-    logging.info("Generated summary from recognized text.")
-    return f"Summary:\n{summary}"
-
-
-# --- Main Processing Function (Example Usage) ---
-
-def process_canvas(image_path: str) -> dict:
-    """
-    Main function to process a canvas image file.
-    Reads an image, performs all processing steps, and returns results.
-    This is an example of how the functions might be orchestrated.
-
-    Args:
-        image_path: Path to the image file.
-
-    Returns:
-        A dictionary containing results from different processing steps:
-        {
-            'ocr_results': list,
-            'math_solutions': list,
-            'flowchart_elements': list,
-            'generated_code': str,
-            'summary': str,
-            'error': str or None
-        }
-    """
-    results = {
-        'ocr_results': [],
-        'math_solutions': [],
-        'flowchart_elements': [],
-        'generated_code': "",
-        'summary': "",
-        'error': None
-    }
-
+            {text}
+            """
+            
+            gemini_response = gemini_model.generate_content(prompt)
+            summary = gemini_response.text.strip()
+            
+            logging.info("Generated note summary with Gemini")
+            return summary
+        except Exception as e:
+            logging.error(f"Error using Gemini for summarization: {e}")
+            # Fall back to basic summarization
+    
+    # Basic summarization if Gemini not available
+    logging.info("Using basic summarization method")
+    
     try:
-        # 1. Read Image
+        # Simple extractive summarization
+        # Split text into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        if len(sentences) <= 3:
+            return text  # Return original text if it's already short
+        
+        # Simple sentence scoring based on position and common important phrases
+        scored_sentences = []
+        important_words = ['key', 'important', 'significant', 'main', 'critical', 'essential', 'note', 'remember']
+        
+        for i, sentence in enumerate(sentences):
+            # Score based on position (first and last sentences often have important info)
+            position_score = 1.0 if i == 0 or i == len(sentences) - 1 else 0.0
+            
+            # Score based on presence of important words
+            word_score = sum(1.0 for word in important_words if word.lower() in sentence.lower()) / len(important_words)
+            
+            # Score based on sentence length (prefer medium-length sentences)
+            length = len(sentence.split())
+            length_score = 1.0 if 5 <= length <= 20 else 0.5
+            
+            # Combine scores
+            total_score = position_score * 0.4 + word_score * 0.4 + length_score * 0.2
+            scored_sentences.append((sentence, total_score))
+        
+        # Sort sentences by score in descending order
+        scored_sentences.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take top 30% of sentences or at least 3 sentences
+        num_sentences = max(3, int(len(sentences) * 0.3))
+        top_sentences = [s[0] for s in scored_sentences[:num_sentences]]
+        
+        # Reorder sentences to maintain original flow
+        original_order = []
+        for sentence in sentences:
+            if sentence in [s for s in top_sentences]:
+                original_order.append(sentence)
+        
+        summary = ' '.join(original_order)
+        return summary
+    except Exception as e:
+        logging.error(f"Error during basic summarization: {e}")
+        return f"Error: Failed to summarize text: {e}"
+
+# --- Combined Processing & Main Class ---
+
+class CanvasProcessor:
+    """
+    Main processor class for Cognito Canvas.
+    
+    Handles all the processing operations for images captured from the canvas,
+    including handwriting recognition, math solving, flowchart analysis, and note summarization.
+    """
+    
+    def __init__(self, use_gemini: bool = True):
+        """
+        Initializes the canvas processor.
+        
+        Args:
+            use_gemini: Whether to use Google's Gemini model for enhanced processing
+        """
+        self.use_gemini = use_gemini and gemini_model is not None
+        logging.info(f"CanvasProcessor initialized. Gemini enabled: {self.use_gemini}")
+    
+    def process_math(self, image: np.ndarray) -> str:
+        """
+        Processes an image of a mathematical expression.
+        Performs handwriting recognition followed by expression evaluation.
+        
+        Args:
+            image: Image containing a mathematical expression (numpy array, BGR format)
+            
+        Returns:
+            A string with the recognized expression and its solution
+        """
+        logging.info("Processing mathematical expression...")
+        
+        if image is None or image.size == 0:
+            return "Error: Invalid input image."
+        
+        try:
+            # 1. Preprocess the image for better OCR
+            processed_image = process_image_for_ocr(image)
+            
+            # 2. Recognize the handwritten math expression
+            ocr_results = recognize_handwriting(processed_image, use_gemini=self.use_gemini)
+            
+            if not ocr_results:
+                return "Error: Could not recognize any text in the image. Please ensure the handwriting is clear."
+            
+            # 3. Combine all recognized text (for math expressions, they should be on a single line)
+            math_expression = ' '.join([text for _, text, _ in ocr_results])
+            
+            logging.info(f"Recognized expression: {math_expression}")
+            
+            # 4. Solve the mathematical expression
+            solution = solve_mathematical_expression(math_expression, use_gemini=self.use_gemini)
+            
+            return f"Expression: {math_expression}\nSolution: {solution}"
+        except Exception as e:
+            logging.error(f"Error processing math expression: {e}")
+            return f"Error: Failed to process mathematical expression: {e}"
+    
+    def process_flowchart(self, image: np.ndarray) -> str:
+        """
+        Processes an image of a flowchart.
+        Detects flowchart elements and generates corresponding code.
+        
+        Args:
+            image: Image containing a flowchart (numpy array, BGR format)
+            
+        Returns:
+            Generated code as a string
+        """
+        logging.info("Processing flowchart...")
+        
+        if image is None or image.size == 0:
+            return "Error: Invalid input image."
+        
+        try:
+            # 1. Detect flowchart elements
+            elements = detect_flowchart_elements(image, use_gemini=self.use_gemini)
+            
+            if not elements:
+                return "Error: Could not detect any flowchart elements. Please ensure the drawing is clear."
+            
+            # 2. Generate Python code from the flowchart
+            code = generate_code_from_flowchart(elements, language='python', use_gemini=self.use_gemini)
+            
+            return f"Detected {len(elements)} flowchart elements.\nGenerated Code:\n\n{code}"
+        except Exception as e:
+            logging.error(f"Error processing flowchart: {e}")
+            return f"Error: Failed to process flowchart: {e}"
+    
+    def process_notes(self, image: np.ndarray) -> str:
+        """
+        Processes an image of handwritten notes.
+        Performs handwriting recognition and summarizes the content.
+        
+        Args:
+            image: Image containing handwritten notes (numpy array, BGR format)
+            
+        Returns:
+            Original recognized text and its summary
+        """
+        logging.info("Processing handwritten notes...")
+        
+        if image is None or image.size == 0:
+            return "Error: Invalid input image."
+        
+        try:
+            # 1. Preprocess the image for better OCR
+            processed_image = process_image_for_ocr(image)
+            
+            # 2. Recognize the handwritten text
+            ocr_results = recognize_handwriting(processed_image, use_gemini=self.use_gemini)
+            
+            if not ocr_results:
+                return "Error: Could not recognize any text in the image. Please ensure the handwriting is clear."
+            
+            # 3. Combine all recognized text, preserving paragraph breaks
+            lines = []
+            prev_y = None
+            line_texts = []
+            
+            # Sort by vertical position (y-coordinate)
+            sorted_results = sorted(ocr_results, key=lambda x: x[0][0][1])  # Sort by top y-coordinate
+            
+            for bbox, text, _ in sorted_results:
+                # Calculate average y-coordinate of the bounding box
+                y_coords = [pt[1] for pt in bbox]
+                avg_y = sum(y_coords) / len(y_coords)
+                
+                # Check if this is a new line
+                if prev_y is None or abs(avg_y - prev_y) > 20:  # Threshold for new line
+                    if line_texts:
+                        lines.append(' '.join(line_texts))
+                    line_texts = [text]
+                else:
+                    line_texts.append(text)
+                
+                prev_y = avg_y
+            
+            # Add the last line
+            if line_texts:
+                lines.append(' '.join(line_texts))
+            
+            full_text = '\n'.join(lines)
+            
+            logging.info(f"Recognized text ({len(full_text)} chars)")
+            
+            # 4. Summarize the recognized text
+            if len(full_text) > 100:  # Only summarize if there's enough text
+                summary = summarize_notes(full_text, use_gemini=self.use_gemini)
+                return f"Original Text:\n\n{full_text}\n\nSummary:\n\n{summary}"
+            else:
+                return f"Recognized Text:\n\n{full_text}\n\n(Text too short to summarize)"
+        except Exception as e:
+            logging.error(f"Error processing notes: {e}")
+            return f"Error: Failed to process handwritten notes: {e}"
+
+# --- Main execution (for testing) ---
+
+if __name__ == "__main__":
+    # This section allows testing the processor functions directly
+    logging.info("Testing the processor module...")
+    
+    # Check Gemini availability
+    if gemini_model:
+        logging.info("Gemini model is available")
+    else:
+        logging.info("Gemini model is not available, using fallback methods")
+    
+    # Example test function
+    def test_with_image(image_path, process_func):
+        if not os.path.exists(image_path):
+            logging.error(f"Test image not found: {image_path}")
+            return None
+        
+        # Load image
         image = cv2.imread(image_path)
         if image is None:
-            raise FileNotFoundError(f"Could not read image file: {image_path}")
-
-        # 2. Recognize Handwriting/Text
-        # Preprocessing for OCR is often handled internally by EasyOCR or can be detrimental.
-        # Pass the original color image directly to EasyOCR.
-        # If results are poor, try passing the preprocessed image instead:
-        # processed_for_ocr = process_image_for_ocr(image)
-        # if processed_for_ocr is not None:
-        #     results['ocr_results'] = recognize_handwriting(processed_for_ocr) # Pass processed
-        # else: # Fallback or handle error
-        #     results['ocr_results'] = recognize_handwriting(image) # Pass original
-        results['ocr_results'] = recognize_handwriting(image) # Use original image
-
-        # 3. Solve Mathematical Expressions found in text
-        for _, text, _ in results['ocr_results']:
-            # Basic check if text looks like a math expression (contains numbers and operators)
-            # This is a very simple heuristic. More robust detection might be needed.
-            if any(c in text for c in '+-*/=') and any(c.isdigit() for c in text):
-                 solution = solve_mathematical_expression(text)
-                 if solution: # Avoid adding empty solutions or just errors if not desired
-                     results['math_solutions'].append({'expression': text, 'solution': solution})
-
-        # 4. Detect Flowchart Elements
-        # Use the original image for shape detection as preprocessing might distort shapes
-        results['flowchart_elements'] = detect_flowchart_elements(image)
-
-        # 5. Generate Code from Flowchart
-        if results['flowchart_elements']:
-            results['generated_code'] = generate_code_from_flowchart(results['flowchart_elements'])
-        else:
-            results['generated_code'] = "# No flowchart elements detected."
-
-        # 6. Summarize Content
-        results['summary'] = summarize_canvas_content(image, results['ocr_results'])
-
-    except FileNotFoundError as e:
-        logging.error(f"Processing error: {e}")
-        results['error'] = str(e)
-    except cv2.error as e:
-        logging.error(f"OpenCV error during processing: {e}")
-        results['error'] = f"Image processing error: {e}"
-    except Exception as e:
-        logging.error(f"Unexpected error during canvas processing: {e}", exc_info=True)
-        results['error'] = f"An unexpected error occurred: {e}"
-
-    return results
-
-# Example usage when running the script directly
-if __name__ == '__main__':
-    print("Cognito Canvas Processor Module")
-    print("Running example processing on a placeholder image path...")
-
-    # Create a dummy white image for testing if no image is provided
-    dummy_image_path = "dummy_canvas.png"
-    try:
-        # Check if dummy file exists, if not create one
-        import os
-        if not os.path.exists(dummy_image_path):
-            dummy_img = np.ones((600, 800, 3), dtype=np.uint8) * 255 # White image
-            # Add some sample elements for testing
-            # Draw a rectangle
-            cv2.rectangle(dummy_img, (100, 100), (300, 200), (0, 0, 0), 2)
-            cv2.putText(dummy_img, "Start Process", (110, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-            # Draw a diamond (approx)
-            pts = np.array([[400, 250], [500, 300], [400, 350], [300, 300]], np.int32)
-            pts = pts.reshape((-1, 1, 2))
-            cv2.polylines(dummy_img, [pts], isClosed=True, color=(0,0,0), thickness=2)
-            cv2.putText(dummy_img, "x > 10?", (330, 305), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-            # Draw some math
-            cv2.putText(dummy_img, "2 * (5 + 3) = ?", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-            cv2.imwrite(dummy_image_path, dummy_img)
-            print(f"Created dummy image: {dummy_image_path}")
-
-        # Process the dummy image
-        processing_results = process_canvas(dummy_image_path)
-
-        print("\n--- Processing Results ---")
-        if processing_results['error']:
-            print(f"Error: {processing_results['error']}")
-        else:
-            print("\nOCR Results:")
-            if processing_results['ocr_results']:
-                for bbox, text, conf in processing_results['ocr_results']:
-                    print(f"- Text: '{text}', Confidence: {conf:.2f}") # Bbox omitted for brevity
-            else:
-                print("- No text found.")
-
-            print("\nMath Solutions:")
-            if processing_results['math_solutions']:
-                for item in processing_results['math_solutions']:
-                    print(f"- Expression: '{item['expression']}', Solution: {item['solution']}")
-            else:
-                print("- No mathematical expressions solved.")
-
-            print("\nFlowchart Elements:")
-            if processing_results['flowchart_elements']:
-                for elem in processing_results['flowchart_elements']:
-                    print(f"- Shape: {elem['shape']}, Center: {elem['center']}, Text: '{elem['text']}'")
-            else:
-                print("- No flowchart elements detected.")
-
-            print("\nGenerated Code:")
-            print(processing_results['generated_code'])
-
-            print("\nSummary:")
-            print(processing_results['summary'])
-
-    except ImportError:
-         print("\nNote: OpenCV is required to create/run the dummy image example.")
-    except Exception as e:
-        print(f"\nAn error occurred during the example run: {e}")
+            logging.error(f"Failed to load image: {image_path}")
+            return None
+        
+        # Process image
+        result = process_func(image)
+        logging.info(f"Result: {result[:100]}...")  # Log first 100 chars
+        return result
+    
+    # Define test images (user would need to create these)
+    test_dir = "test_images"
+    if os.path.exists(test_dir):
+        processor = CanvasProcessor()
+        
+        # Test math processing
+        math_image = os.path.join(test_dir, "math_example.jpg")
+        if os.path.exists(math_image):
+            test_with_image(math_image, processor.process_math)
+        
+        # Test flowchart processing
+        flowchart_image = os.path.join(test_dir, "flowchart_example.jpg")
+        if os.path.exists(flowchart_image):
+            test_with_image(flowchart_image, processor.process_flowchart)
+        
+        # Test note processing
+        notes_image = os.path.join(test_dir, "notes_example.jpg")
+        if os.path.exists(notes_image):
+            test_with_image(notes_image, processor.process_notes)
+    else:
+        logging.info(f"Test directory not found: {test_dir}")
+        logging.info("Skipping image tests")
