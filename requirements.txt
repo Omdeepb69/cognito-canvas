@@ -1,0 +1,6 @@
+kivy: For the core application framework and UI (Android deployment).
+opencv-python: For image processing, shape detection, and pre-processing inputs for OCR.
+easyocr: For robust handwriting and text recognition directly from canvas drawings.
+sympy: For parsing and solving the recognized mathematical expressions.
+networkx (Optional): Useful for analyzing connections in detected flowcharts.
+nltk or spacy (Optional): For more advanced text summarization features beyond simple extraction.
